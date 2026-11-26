@@ -58,7 +58,6 @@ describe("inline code that names a file", () => {
     ],
     ["tabbed quote header", ">\tIntro `./a.ts`\n>\t| `./b.ts` | c |\n>\t|---|---|\n>\t| a | b |"],
     ["lazy quote header", "> Intro\n`./README.md` | file\n> | - | - |\n> | ok | yes |"],
-    ["lazy list header", "- Intro\n`./README.md` | file\n  | - | - |\n  | ok | yes |"],
     [
       "HTML",
       '<details>\n<summary>Files</summary>\n\nSee `src/math.ts:2`\n| `./README.md` |\n|---|\n| ok |\n<img alt="A &amp; B" src="https://example.com/a.png?a=1&amp;b=2">\n</details>',

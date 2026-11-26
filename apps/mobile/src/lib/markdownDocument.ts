@@ -1,4 +1,4 @@
-import type { Root, RootContent } from "mdast";
+import type { Root, RootContent, Table } from "mdast";
 import { unified, type Processor } from "unified";
 import remarkParse from "remark-parse";
 import remarkGfm from "remark-gfm";
@@ -341,7 +341,7 @@ function transformNativeMarkdown(
   fileLink: RegExp | undefined,
   tableBreaks: boolean,
 ): string {
-  const breakTables = tableBreaks && mayHaveTableUnderText(markdown);
+  const breakTables = tableBreaks && mayNeedTableBreaks(markdown);
   let linkFiles = false;
   if (fileLink) {
     for (const [, code] of markdown.matchAll(INLINE_CODE_SPAN)) {
@@ -356,7 +356,8 @@ function transformNativeMarkdown(
   const edits: MarkdownEdit[] = [];
   const fileEdits: MarkdownEdit[] = [];
   let rewritesPipe = false;
-  const visit = (node: MarkdownNode) => {
+  let listTable = false;
+  const visit = (node: MarkdownNode, inList: boolean) => {
     if (linkFiles && node.type === "inlineCode") {
       const start = node.position?.start.offset;
       const end = node.position?.end.offset;
@@ -401,7 +402,8 @@ function transformNativeMarkdown(
       node.children.forEach((child, index) => {
         const previous = node.children[index - 1];
         const start = child.position?.start;
-        if (
+        if (breakTables && inList && child.type === "table") listTable = true;
+        else if (
           breakTables &&
           child.type === "table" &&
           previous?.type === "paragraph" &&
@@ -419,14 +421,141 @@ function transformNativeMarkdown(
             content: `${markers.trimEnd()}${ending}${markers}`,
           });
         }
-        visit(child);
+        visit(child, inList || node.type === "list");
       });
   };
-  visit(parser.parse(markdown));
+  const root = parser.parse(markdown);
+  visit(root, false);
   // Rewritten pipes can change table structure, so preserve the original pass ordering.
   if (breakTables && rewritesPipe)
     return markdownWithTableBreaks(applyMarkdownEdits(markdown, fileEdits));
-  return applyMarkdownEdits(markdown, edits);
+  if (!listTable) return applyMarkdownEdits(markdown, edits);
+  const allEdits = [...edits, ...listTableEdits(markdown, root)];
+  return applyMarkdownEdits(
+    markdown,
+    allEdits.sort((a, b) => a.start - b.start || a.end - b.end),
+  );
+}
+
+interface LinePlan {
+  readonly prefix: string;
+  readonly quotes: number;
+  readonly row?: boolean;
+  readonly content?: number;
+  readonly dedent?: number;
+  readonly blank?: boolean;
+}
+
+const BLOCKQUOTE_MARKER = /^[ \t]{0,3}>[ \t]?/;
+
+/**
+ * The native renderer draws a table only outside lists, so a table in a list item moves out to
+ * the list's container. That ends the list there: the rest of the item and the items after it
+ * follow below the table, dedented to their new depth, and an ordered list keeps its numbering.
+ */
+function listTableEdits(markdown: string, root: Root): MarkdownEdit[] {
+  const lineStarts = [0];
+  for (const match of markdown.matchAll(/\r\n|\r|\n/g))
+    lineStarts.push(match.index + match[0].length);
+  const newline = /\r\n|\r|\n/.exec(markdown)?.[0] ?? "\n";
+  const lineText = (line: number) =>
+    markdown.slice(lineStarts[line], lineStarts[line + 1] ?? markdown.length);
+  const isBlank = (line: number) => !/[^ \t>\r\n]/.test(lineText(line));
+  const plans = new Map<number, LinePlan>();
+  const edits: MarkdownEdit[] = [];
+
+  const hoist = (table: Table, path: readonly MarkdownNode[]) => {
+    const listIndex = path.findIndex((ancestor) => ancestor.type === "list");
+    const listPosition = path[listIndex]?.position;
+    const tableStart = table.position?.start;
+    const tableEnd = table.position?.end;
+    if (!listPosition || !tableStart || !tableEnd || tableStart.offset === undefined) return;
+    const quotes = path.slice(0, listIndex).filter((node) => node.type === "blockquote").length;
+    const prefix = "> ".repeat(quotes);
+    const items = path.slice(listIndex).flatMap((node, index, nodes) => {
+      const parent = nodes[index - 1];
+      if (node.type !== "listItem" || parent?.type !== "list") return [];
+      const indent = (node.children[0]?.position?.start.column ?? 1) - listPosition.start.column;
+      return [{ item: node, parent, indent }];
+    });
+    const first = tableStart.line - 1;
+    const last = tableEnd.line - 1;
+    for (let line = first; line <= last; line += 1)
+      plans.set(line, {
+        prefix,
+        quotes,
+        row: true,
+        ...(line === first && {
+          content: tableStart.offset,
+          blank: line > 0 && !isBlank(line - 1),
+        }),
+      });
+    // The first later item restarts the list, so it needs its own number.
+    let resume = -1;
+    for (let depth = items.length - 1; depth >= 0; depth -= 1) {
+      const { item, parent } = items[depth]!;
+      const index = parent.children.indexOf(item);
+      const next = parent.children[index + 1]?.position?.start;
+      if (next?.offset === undefined) continue;
+      resume = next.line - 1;
+      const number = String((parent.start ?? 1) + index + 1);
+      const digits = /^\d*/.exec(markdown.slice(next.offset))![0];
+      if (parent.ordered && digits && digits !== number)
+        edits.push({ start: next.offset, end: next.offset + digits.length, content: number });
+      break;
+    }
+    for (let line = last + 1; line < listPosition.end.line; line += 1) {
+      const depth = items.findLastIndex(
+        ({ item }) => lineStarts[line]! < (item.position?.end.offset ?? 0),
+      );
+      plans.set(line, {
+        prefix,
+        quotes,
+        dedent: depth === -1 ? 0 : items[depth]!.indent,
+        blank: (line === last + 1 || line === resume) && !isBlank(line) && !isBlank(line - 1),
+      });
+    }
+  };
+
+  const path: MarkdownNode[] = [];
+  const visit = (node: MarkdownNode) => {
+    if (node.type === "table") return hoist(node, path);
+    if (!("children" in node)) return;
+    path.push(node);
+    for (const child of node.children) visit(child);
+    path.pop();
+  };
+  visit(root);
+
+  for (const [line, plan] of plans) {
+    const start = lineStarts[line]!;
+    const quote = plan.prefix.trimEnd();
+    const blank = plan.blank ? `${quote}${newline}` : "";
+    if (plan.row) {
+      const content = plan.content ?? start + /^[ \t>]*/.exec(lineText(line))![0].length;
+      const lead = markdown.slice(start, content);
+      // A table on its item's marker line leaves that item empty above it.
+      edits.push({
+        start,
+        end: content,
+        content: /[^ \t>]/.test(lead)
+          ? `${lead.trimEnd()}${newline}${quote}${newline}${plan.prefix}`
+          : `${blank}${plan.prefix}`,
+      });
+      continue;
+    }
+    if (blank) edits.push({ start, end: start, content: blank });
+    let offset = start;
+    for (let quoteIndex = 0; quoteIndex < plan.quotes; quoteIndex += 1) {
+      const marker = BLOCKQUOTE_MARKER.exec(markdown.slice(offset, offset + 6));
+      if (!marker) break;
+      offset += marker[0].length;
+    }
+    let end = offset;
+    while (end - offset < (plan.dedent ?? 0) && markdown[end] === " ") end += 1;
+    if (end > offset) edits.push({ start: offset, end, content: "" });
+  }
+  return edits;
 }
 
 // A delimiter row such as `|---|:--:|`, possibly inside a blockquote or list item.
@@ -439,11 +568,14 @@ function isTableDelimiterRow(line: string): boolean {
     .every((cell) => /^:?-+:?$/.test(cell.trim()));
 }
 
-function mayHaveTableUnderText(markdown: string): boolean {
+function mayNeedTableBreaks(markdown: string): boolean {
   if (!markdown.includes("|")) return false;
   const lines = markdown.split(/\r\n|\r|\n/);
-  for (let index = 2; index < lines.length; index += 1) {
-    if (isTableDelimiterRow(lines[index]!) && /[^\s>]/.test(lines[index - 2]!)) return true;
+  for (let index = 1; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    if (!isTableDelimiterRow(line)) continue;
+    // A table in a list item has its delimiter row indented to the item's content.
+    if (/^[ \t>]*[ \t]{2}/.test(line) || /[^\s>]/.test(lines[index - 2] ?? "")) return true;
   }
   return false;
 }
